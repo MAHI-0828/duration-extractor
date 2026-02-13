@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+.git
+.gitignore
+.venv
+env/
+venv/
+.cursor/
+
