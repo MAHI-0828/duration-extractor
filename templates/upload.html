@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Session Duration Extractor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <div class="card">
+        <h1 class="title">Session Duration Extractor</h1>
+        <p class="subtitle">Upload CSV → Get durations</p>
+
+        <form id="upload-form" class="form" enctype="multipart/form-data">
+          <div id="drop-zone" class="drop-zone">
+            <input
+              id="file-input"
+              name="file"
+              type="file"
+              accept=".csv"
+              class="file-input"
+            />
+            <div class="drop-zone-content">
+              <span id="file-label" class="file-label">
+                Drag & drop CSV here or click to browse
+              </span>
+            </div>
+          </div>
+
+          <button id="process-button" type="submit" class="button">
+            Process
+          </button>
+        </form>
+
+        <div id="progress-container" class="progress-container hidden">
+          <div class="progress-bar-track">
+            <div id="progress-bar" class="progress-bar-fill"></div>
+          </div>
+          <span id="progress-text" class="progress-text">0%</span>
+        </div>
+
+        <button
+          id="download-button"
+          type="button"
+          class="button secondary hidden"
+        >
+          Download CSV
+        </button>
+
+        <a id="download-link" class="hidden" download="video_durations.csv"></a>
+      </div>
+    </div>
+
+    <script>
+      (function () {
+        const form = document.getElementById("upload-form");
+        const fileInput = document.getElementById("file-input");
+        const dropZone = document.getElementById("drop-zone");
+        const fileLabel = document.getElementById("file-label");
+        const processButton = document.getElementById("process-button");
+        const progressContainer = document.getElementById("progress-container");
+        const progressBar = document.getElementById("progress-bar");
+        const progressText = document.getElementById("progress-text");
+        const downloadButton = document.getElementById("download-button");
+        const downloadLink = document.getElementById("download-link");
+
+        let progressTimer = null;
+
+        function setProgress(value) {
+          const v = Math.max(0, Math.min(100, value));
+          progressBar.style.width = v + "%";
+          progressText.textContent = v + "%";
+        }
+
+        function startFakeProgress() {
+          progressContainer.classList.remove("hidden");
+          setProgress(5);
+          let current = 5;
+          progressTimer = setInterval(() => {
+            // Ease towards 90% while waiting for server
+            if (current < 90) {
+              current += Math.random() * 5;
+              setProgress(current);
+            }
+          }, 300);
+        }
+
+        function stopFakeProgress() {
+          if (progressTimer) {
+            clearInterval(progressTimer);
+            progressTimer = null;
+          }
+        }
+
+        function resetUI() {
+          stopFakeProgress();
+          setProgress(0);
+          progressContainer.classList.add("hidden");
+          downloadButton.classList.add("hidden");
+          downloadLink.href = "";
+          processButton.disabled = false;
+          processButton.textContent = "Process";
+        }
+
+        // Drag & drop behavior
+        ["dragenter", "dragover"].forEach((eventName) => {
+          dropZone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropZone.classList.add("dragover");
+          });
+        });
+
+        ["dragleave", "drop"].forEach((eventName) => {
+          dropZone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (eventName === "dragleave" && e.target === dropZone) {
+              dropZone.classList.remove("dragover");
+            }
+            if (eventName === "drop") {
+              dropZone.classList.remove("dragover");
+            }
+          });
+        });
+
+        dropZone.addEventListener("drop", (e) => {
+          const dt = e.dataTransfer;
+          if (!dt || !dt.files || !dt.files.length) return;
+          const file = dt.files[0];
+          if (!file.name.toLowerCase().endsWith(".csv")) return;
+
+          const dataTransfer = new DataTransfer();
+          dataTransfer.items.add(file);
+          fileInput.files = dataTransfer.files;
+          fileLabel.textContent = file.name;
+        });
+
+        dropZone.addEventListener("click", () => {
+          fileInput.click();
+        });
+
+        fileInput.addEventListener("change", () => {
+          if (fileInput.files && fileInput.files[0]) {
+            fileLabel.textContent = fileInput.files[0].name;
+          } else {
+            fileLabel.textContent =
+              "Drag & drop CSV here or click to browse";
+          }
+        });
+
+        // Form submit with fetch to existing /process endpoint
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          if (!fileInput.files || !fileInput.files[0]) {
+            alert("Please select a CSV file.");
+            return;
+          }
+
+          const file = fileInput.files[0];
+
+          // Client-side validation: type and size (5 MB)
+          const isCsvExt = file.name.toLowerCase().endsWith(".csv");
+          const isCsvMime =
+            file.type === "text/csv" ||
+            file.type === "application/vnd.ms-excel" ||
+            file.type === "application/csv";
+
+          if (!isCsvExt && !isCsvMime) {
+            alert("Only CSV files are allowed.");
+            return;
+          }
+
+          const maxBytes = 5 * 1024 * 1024;
+          if (file.size > maxBytes) {
+            alert("File is too large. Maximum size is 5 MB.");
+            return;
+          }
+
+          processButton.disabled = true;
+          processButton.textContent = "Processing…";
+          downloadButton.classList.add("hidden");
+          startFakeProgress();
+
+          try {
+            const formData = new FormData();
+            formData.append("file", file);
+
+            const response = await fetch("/process", {
+              method: "POST",
+              body: formData,
+            });
+
+            if (!response.ok) {
+              const message = await response.text();
+              throw new Error(message || "Upload failed");
+            }
+
+            const blob = await response.blob();
+            stopFakeProgress();
+            setProgress(100);
+
+            const url = window.URL.createObjectURL(blob);
+            downloadLink.href = url;
+
+            downloadButton.classList.remove("hidden");
+          } catch (err) {
+            resetUI();
+            alert(err.message || "There was a problem processing your file. Please try again.");
+          } finally {
+            processButton.disabled = false;
+            processButton.textContent = "Process";
+          }
+        });
+
+        downloadButton.addEventListener("click", () => {
+          if (!downloadLink.href) return;
+          downloadLink.click();
+        });
+      })();
+    </script>
+  </body>
+</html>
