@@ -1,165 +1,129 @@
-from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, Response, PlainTextResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-
-import csv
-import io
-import json
-import asyncio
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
+import uuid, os, csv, io, json, asyncio, signal
 from urllib.parse import urlparse, parse_qs, unquote
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# max parallel ffprobe processes
-MAX_CONCURRENT_PROBES = 8
-PROBE_TIMEOUT = 45
+BASE = "jobs"
+os.makedirs(BASE, exist_ok=True)
+
+MAX_CONCURRENT_PROBES = 5
+PROBE_TIMEOUT = 25
 
 
-# ---------------- URL PARSER ----------------
-def extract_mp4_url(play_link: str) -> str | None:
-    if not play_link:
-        return None
-
+# ---------- URL ----------
+def extract_mp4_url(link: str):
+    if not link: return None
     try:
-        parsed = urlparse(play_link)
-        qs = parse_qs(parsed.query or "")
-        url_vals = qs.get("url")
-        if url_vals and url_vals[0]:
-            return unquote(url_vals[0].strip())
-    except Exception:
+        qs = parse_qs(urlparse(link).query)
+        if "url" in qs:
+            return unquote(qs["url"][0])
+    except:
         pass
-
-    lower = play_link.lower()
-    key = "url="
-    idx = lower.find(key)
-    if idx == -1:
-        return None
-
-    raw = play_link[idx + len(key):]
-    amp = raw.find("&")
-    if amp != -1:
-        raw = raw[:amp]
-
-    raw = raw.strip()
-    return unquote(raw) if raw else None
+    if "url=" in link:
+        return unquote(link.split("url=")[1].split("&")[0])
+    return None
 
 
-# ---------------- ASYNC FFPROBE ----------------
-async def probe_duration_seconds_async(mp4_url: str, semaphore: asyncio.Semaphore):
-    async with semaphore:
+# ---------- FFPROBE ----------
+async def probe(url, sem):
+    async with sem:
         try:
-            process = await asyncio.create_subprocess_exec(
-                "ffprobe",
-                "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "json",
-                mp4_url,
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe","-v","error",
+                "-rw_timeout","15000000",
+                "-timeout","15000000",
+                "-show_entries","format=duration",
+                "-of","json",url,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                preexec_fn=os.setsid
             )
 
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=PROBE_TIMEOUT
-                )
+                out,_ = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
             except asyncio.TimeoutError:
-                process.kill()
-                return "timeout", ""
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                return "timeout",""
 
-            if process.returncode != 0:
-                return "ffprobe_error", ""
+            if proc.returncode!=0: return "ffprobe_error",""
 
-            data = json.loads(stdout.decode() or "{}")
-            duration_str = data.get("format", {}).get("duration")
-            if not duration_str:
-                return "no_duration", ""
-
-            seconds = float(duration_str)
-            return f"{seconds:.2f}", f"{seconds/60:.2f}"
-
-        except Exception:
-            return "ffprobe_crash", ""
+            d=json.loads(out.decode() or "{}").get("format",{}).get("duration")
+            if not d: return "no_duration",""
+            d=float(d)
+            return f"{d:.2f}",f"{d/60:.2f}"
+        except:
+            return "ffprobe_crash",""
 
 
-# ---------------- PAGE ----------------
-@app.get("/", response_class=HTMLResponse)
-def upload_form(request: Request):
-    return templates.TemplateResponse("upload.html", {"request": request})
+# ---------- WORKER ----------
+async def process_job(job_id, path):
+    status_path=f"{BASE}/{job_id}/status.json"
+    out_path=f"{BASE}/{job_id}/result.csv"
+
+    with open(path) as f:
+        reader=csv.DictReader(f)
+        reader.fieldnames=[c.strip().lower().replace(" ","_") for c in reader.fieldnames]
+        rows=list(reader)
+
+    sem=asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+
+    parsed=[]
+    tasks=[]
+    for r in rows:
+        lid=(r.get("lecture_id") or "")
+        link=(r.get("play_link") or r.get("link") or r.get("url") or "")
+        mp4=extract_mp4_url(link) or ""
+        parsed.append((lid,link,mp4))
+        tasks.append(probe(mp4,sem) if mp4 else asyncio.sleep(0,result=("no_url_parsed","")))
+
+    results=[]
+    for i,t in enumerate(asyncio.as_completed(tasks)):
+        res=await t
+        results.append(res)
+        with open(status_path,"w") as s:
+            json.dump({"done":len(results),"total":len(tasks)},s)
+
+    with open(out_path,"w",newline="") as f:
+        w=csv.writer(f)
+        w.writerow(["lecture_id","original_link","mp4_url","duration_seconds","duration_minutes"])
+        for (lid,link,mp4),(sec,minu) in zip(parsed,results):
+            w.writerow([lid,link,mp4,sec,minu])
 
 
-# ---------------- CSV PROCESS ----------------
-@app.post("/process")
-async def process_csv(file: UploadFile = File(...)):
-    if file.content_type not in (
-        "text/csv",
-        "application/vnd.ms-excel",
-        "application/csv"
-    ):
-        return PlainTextResponse("Please upload a CSV file.", status_code=400)
+# ---------- UPLOAD ----------
+@app.post("/upload")
+async def upload(file:UploadFile=File(...)):
+    if not file.filename.endswith(".csv"):
+        return PlainTextResponse("upload csv",400)
 
-    content_bytes = await file.read()
+    job=str(uuid.uuid4())
+    job_dir=f"{BASE}/{job}"
+    os.makedirs(job_dir)
 
-    if len(content_bytes) > 5 * 1024 * 1024:
-        return PlainTextResponse("File is too large. Maximum size is 5 MB.", status_code=400)
+    path=f"{job_dir}/input.csv"
+    with open(path,"wb") as f:
+        f.write(await file.read())
 
-    text = content_bytes.decode("utf-8-sig", errors="ignore")
-    input_io = io.StringIO(text)
+    open(f"{job_dir}/status.json","w").write('{"done":0,"total":1}')
 
-    # ---- Normalize headers ----
-    reader = csv.DictReader(input_io)
-    reader.fieldnames = [
-        name.strip().lower().replace(" ", "_")
-        for name in reader.fieldnames
-    ]
+    asyncio.create_task(process_job(job,path))
 
-    rows = list(reader)
+    return {"job_id":job}
 
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
-    tasks = []
 
-    parsed_rows = []
+# ---------- STATUS ----------
+@app.get("/status/{job}")
+def status(job:str):
+    p=f"{BASE}/{job}/status.json"
+    if not os.path.exists(p): return {"error":"invalid job"}
+    return json.load(open(p))
 
-    for row in rows:
-        lecture_id = (row.get("lecture_id") or "").strip()
-        original_link = (
-            row.get("play_link")
-            or row.get("link")
-            or row.get("url")
-            or ""
-        ).strip()
 
-        mp4_url = extract_mp4_url(original_link) or ""
-
-        parsed_rows.append((lecture_id, original_link, mp4_url))
-
-        if mp4_url:
-            tasks.append(probe_duration_seconds_async(mp4_url, semaphore))
-        else:
-            tasks.append(asyncio.sleep(0, result=("no_url_parsed", "")))
-
-    results = await asyncio.gather(*tasks)
-
-    # ---- Write Output ----
-    output_io = io.StringIO()
-    writer = csv.writer(output_io)
-
-    writer.writerow([
-        "lecture_id",
-        "original_link",
-        "mp4_url",
-        "duration_seconds",
-        "duration_minutes"
-    ])
-
-    for (lecture_id, original_link, mp4_url), (sec, mins) in zip(parsed_rows, results):
-        writer.writerow([lecture_id, original_link, mp4_url, sec, mins])
-
-    return Response(
-        content=output_io.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="video_durations.csv"'}
-    )
+# ---------- DOWNLOAD ----------
+@app.get("/download/{job}")
+def download(job:str):
+    p=f"{BASE}/{job}/result.csv"
+    if not os.path.exists(p): return {"error":"not ready"}
+    return FileResponse(p,filename="video_durations.csv")
